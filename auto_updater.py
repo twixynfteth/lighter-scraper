@@ -19,8 +19,13 @@ from typing import Optional, List
 PROXY = os.environ.get('PROXY_URL', '')
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
 GITHUB_REPO = os.environ.get('GITHUB_REPO', 'twixynfteth/lighter-dashboard')
-DB_PATH = 'lighter_data.db'
-CSV_PATH = 'top_holders.csv'
+
+# Use /app/data for persistent storage (Railway volume)
+DATA_DIR = '/app/data'
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(DATA_DIR, 'lighter_data.db')
+CSV_PATH = os.path.join(DATA_DIR, 'top_holders.csv')
 TOP_HOLDERS = 10000
 
 BASE_URL = "https://mainnet.zklighter.elliot.ai/api/v1/account"
@@ -314,33 +319,77 @@ async def main():
         indexes = list(range(0, 50000))
         random.shuffle(indexes)
     
-    # Scrape
-    scraper = Scraper(PROXY, db)
-    await scraper.scrape_indexes(indexes, concurrent=50, burst_size=2000, pause=30)
+    target_count = len(indexes)
+    max_retries = 5
+    retry = 0
     
-    # Retry failed (scrape again to fill gaps)
-    count_after, _ = db.get_stats()
-    if count_after < len(indexes) * 0.95:  # Less than 95% success
-        print("\n🔄 Retrying to fill gaps...")
-        indexes_retry = db.get_top_account_indexes(TOP_HOLDERS)
-        if len(indexes_retry) > 0:
-            missing = [i for i in range(max(indexes_retry)) if i not in set(indexes_retry)][:5000]
-            if missing:
-                await scraper.scrape_indexes(missing, concurrent=30, burst_size=1000, pause=45)
-    
-    # Export CSV
-    db.export_csv(CSV_PATH, TOP_HOLDERS)
-    
-    # Push to GitHub
-    if GITHUB_TOKEN and GITHUB_REPO:
-        push_to_github(CSV_PATH, GITHUB_TOKEN, GITHUB_REPO)
-    else:
-        print("⚠️ GitHub credentials not set. Skipping push.")
+    while retry < max_retries:
+        retry += 1
+        print(f"\n{'='*60}")
+        print(f"🔄 Scrape attempt {retry}/{max_retries}")
+        print(f"{'='*60}")
+        
+        # Scrape
+        scraper = Scraper(PROXY, db)
+        await scraper.scrape_indexes(indexes, concurrent=50, burst_size=2000, pause=30)
+        
+        # Check success rate
+        current_count, _ = db.get_stats()
+        success_rate = (current_count / target_count) * 100 if target_count > 0 else 0
+        
+        print(f"\n📊 Progress: {current_count:,}/{target_count:,} ({success_rate:.1f}%)")
+        
+        if success_rate >= 95:
+            print("✅ 95% threshold reached!")
+            break
+        
+        # Get missing indexes for retry
+        existing = set(db.get_top_account_indexes(100000))
+        if len(indexes) < 50000:
+            all_needed = set(range(0, 50000))
+        else:
+            all_needed = set(indexes)
+        
+        missing = list(all_needed - existing)
+        
+        if not missing:
+            print("✅ No missing accounts!")
+            break
+        
+        print(f"⚠️ Missing {len(missing):,} accounts. Retrying...")
+        random.shuffle(missing)
+        indexes = missing[:10000]  # Retry up to 10K at a time
+        
+        # Longer pause between retries
+        if retry < max_retries:
+            print("⏸️ Waiting 60s before retry...")
+            await asyncio.sleep(60)
     
     # Final stats
     final_count, final_total = db.get_stats()
-    print(f"\n📊 Final DB: {final_count:,} accounts, {final_total:,.0f} LIT")
-    print("✅ Daily update complete!")
+    final_rate = (final_count / target_count) * 100 if target_count > 0 else 0
+    
+    print(f"\n{'='*60}")
+    print(f"📊 Final: {final_count:,} accounts ({final_rate:.1f}%)")
+    print(f"💰 Total LIT tracked: {final_total:,.0f}")
+    print(f"{'='*60}")
+    
+    # Only deploy if we have good data
+    if final_rate >= 95:
+        # Export CSV
+        db.export_csv(CSV_PATH, TOP_HOLDERS)
+        
+        # Push to GitHub
+        if GITHUB_TOKEN and GITHUB_REPO:
+            push_to_github(CSV_PATH, GITHUB_TOKEN, GITHUB_REPO)
+            print("\n✅ Deployed successfully!")
+        else:
+            print("⚠️ GitHub credentials not set. Skipping push.")
+    else:
+        print(f"\n❌ Only {final_rate:.1f}% success. NOT deploying to avoid bad data.")
+        print("   Will retry on next scheduled run.")
+    
+    print("\n✅ Daily update complete!")
 
 
 if __name__ == '__main__':
