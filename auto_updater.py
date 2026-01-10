@@ -308,13 +308,25 @@ async def main():
     # Get top account indexes to update
     indexes = db.get_top_account_indexes(TOP_HOLDERS)
     
-    if not indexes:
-        print("⚠️ No accounts in database. Run initial scrape first.")
-        return
+    if len(indexes) < 1000:
+        # Database is empty or small - do initial scrape of first 50K accounts
+        print("⚠️ Database needs initial data. Scraping accounts 0-50000...")
+        indexes = list(range(0, 50000))
+        random.shuffle(indexes)
     
     # Scrape
     scraper = Scraper(PROXY, db)
     await scraper.scrape_indexes(indexes, concurrent=50, burst_size=2000, pause=30)
+    
+    # Retry failed (scrape again to fill gaps)
+    count_after, _ = db.get_stats()
+    if count_after < len(indexes) * 0.95:  # Less than 95% success
+        print("\n🔄 Retrying to fill gaps...")
+        indexes_retry = db.get_top_account_indexes(TOP_HOLDERS)
+        if len(indexes_retry) > 0:
+            missing = [i for i in range(max(indexes_retry)) if i not in set(indexes_retry)][:5000]
+            if missing:
+                await scraper.scrape_indexes(missing, concurrent=30, burst_size=1000, pause=45)
     
     # Export CSV
     db.export_csv(CSV_PATH, TOP_HOLDERS)
@@ -325,7 +337,10 @@ async def main():
     else:
         print("⚠️ GitHub credentials not set. Skipping push.")
     
-    print("\n✅ Daily update complete!")
+    # Final stats
+    final_count, final_total = db.get_stats()
+    print(f"\n📊 Final DB: {final_count:,} accounts, {final_total:,.0f} LIT")
+    print("✅ Daily update complete!")
 
 
 if __name__ == '__main__':
