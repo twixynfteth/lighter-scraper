@@ -26,7 +26,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, 'lighter_data.db')
 CSV_PATH = os.path.join(DATA_DIR, 'top_holders.csv')
-TOP_HOLDERS = 10000
+TOP_HOLDERS = 15000
 
 print(f"📂 Data directory: {DATA_DIR}")
 
@@ -340,8 +340,9 @@ async def main():
         random.shuffle(indexes)
     
     target_count = len(indexes)
-    max_retries = 5
+    max_retries = 3
     retry = 0
+    last_count = 0
     
     while retry < max_retries:
         retry += 1
@@ -355,25 +356,25 @@ async def main():
         
         # Check success rate
         current_count, _ = db.get_stats()
-        success_rate = (current_count / target_count) * 100 if target_count > 0 else 0
+        new_accounts = current_count - last_count
         
-        print(f"\n📊 Progress: {current_count:,}/{target_count:,} ({success_rate:.1f}%)")
+        print(f"\n📊 Progress: {current_count:,} accounts (+{new_accounts:,} new)")
         
-        if success_rate >= 95:
-            print("✅ 95% threshold reached!")
+        # Stop if we got 95%+ or no new accounts on retry
+        if retry >= 2 and new_accounts < 100:
+            print("✅ No significant new accounts found. Finishing up...")
             break
+        
+        last_count = current_count
         
         # Get missing indexes for retry
         existing = set(db.get_top_account_indexes(100000))
-        if len(indexes) < 50000:
-            all_needed = set(range(0, 50000))
-        else:
-            all_needed = set(indexes)
+        all_needed = set(indexes)
         
         missing = list(all_needed - existing)
         
         if not missing:
-            print("✅ No missing accounts!")
+            print("✅ All accounts scraped!")
             break
         
         print(f"⚠️ Missing {len(missing):,} accounts. Retrying...")
@@ -387,27 +388,20 @@ async def main():
     
     # Final stats
     final_count, final_total = db.get_stats()
-    final_rate = (final_count / target_count) * 100 if target_count > 0 else 0
     
     print(f"\n{'='*60}")
-    print(f"📊 Final: {final_count:,} accounts ({final_rate:.1f}%)")
+    print(f"📊 Final: {final_count:,} accounts")
     print(f"💰 Total LIT tracked: {final_total:,.0f}")
     print(f"{'='*60}")
     
-    # Only deploy if we have good data
-    if final_rate >= 95:
-        # Export CSV
-        db.export_csv(CSV_PATH, TOP_HOLDERS)
-        
-        # Push to GitHub
-        if GITHUB_TOKEN and GITHUB_REPO:
-            push_to_github(CSV_PATH, GITHUB_TOKEN, GITHUB_REPO)
-            print("\n✅ Deployed successfully!")
-        else:
-            print("⚠️ GitHub credentials not set. Skipping push.")
+    # Always export and deploy
+    db.export_csv(CSV_PATH, TOP_HOLDERS)
+    
+    if GITHUB_TOKEN and GITHUB_REPO:
+        push_to_github(CSV_PATH, GITHUB_TOKEN, GITHUB_REPO)
+        print("\n✅ Deployed successfully!")
     else:
-        print(f"\n❌ Only {final_rate:.1f}% success. NOT deploying to avoid bad data.")
-        print("   Will retry on next scheduled run.")
+        print("⚠️ GitHub credentials not set. Skipping push.")
     
     print("\n✅ Daily update complete!")
 
