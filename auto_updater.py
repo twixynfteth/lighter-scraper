@@ -316,9 +316,27 @@ async def main():
     indexes = db.get_top_account_indexes(TOP_HOLDERS)
     
     if len(indexes) < 1000:
-        # Database is empty or small - do initial scrape of first 50K accounts
-        print("⚠️ Database needs initial data. Scraping accounts 0-50000...")
-        indexes = list(range(0, 50000))
+        # Database is empty or small - fetch top holders from existing GitHub CSV
+        print("⚠️ Database needs initial data. Fetching top holders from GitHub...")
+        try:
+            import requests
+            csv_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/top_holders.csv"
+            response = requests.get(csv_url)
+            if response.status_code == 200:
+                lines = response.text.strip().split('\n')
+                # Skip header, get account_index from each row
+                indexes = []
+                for line in lines[1:]:
+                    parts = line.split(',')
+                    if parts[0].isdigit():
+                        indexes.append(int(parts[0]))
+                print(f"📥 Loaded {len(indexes):,} account indexes from GitHub")
+            else:
+                print("⚠️ Could not fetch CSV from GitHub, using range 0-50000")
+                indexes = list(range(0, 50000))
+        except Exception as e:
+            print(f"⚠️ Error fetching CSV: {e}, using range 0-50000")
+            indexes = list(range(0, 50000))
         random.shuffle(indexes)
     
     target_count = len(indexes)
