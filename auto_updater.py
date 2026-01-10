@@ -20,13 +20,15 @@ PROXY = os.environ.get('PROXY_URL', '')
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
 GITHUB_REPO = os.environ.get('GITHUB_REPO', 'twixynfteth/lighter-dashboard')
 
-# Use /app/data for persistent storage (Railway volume)
-DATA_DIR = '/app/data'
+# Use local directory - Railway volumes can cause issues with cron
+DATA_DIR = '/app/data' if os.path.exists('/app/data') else '/app'
 os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, 'lighter_data.db')
 CSV_PATH = os.path.join(DATA_DIR, 'top_holders.csv')
 TOP_HOLDERS = 10000
+
+print(f"📂 Data directory: {DATA_DIR}")
 
 BASE_URL = "https://mainnet.zklighter.elliot.ai/api/v1/account"
 
