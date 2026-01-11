@@ -95,26 +95,42 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        today = datetime.utcnow().strftime('%Y-%m-%d')
-        yesterday = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
+        # Check if previous_balances table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='previous_balances'")
+        has_previous = cursor.fetchone() is not None
         
-        query = '''
-            SELECT 
-                a.account_index,
-                a.address,
-                a.balance,
-                COALESCE(h.balance, a.balance) as yesterday_balance,
-                a.balance - COALESCE(h.balance, a.balance) as change_24h,
-                a.raw_data
-            FROM accounts a
-            LEFT JOIN balance_history h ON a.account_index = h.account_index AND h.recorded_date = ?
-            WHERE a.balance > 0
-            ORDER BY a.balance DESC
-        '''
+        if has_previous:
+            query = '''
+                SELECT 
+                    a.account_index,
+                    a.address,
+                    a.balance,
+                    COALESCE(p.balance, a.balance) as previous_balance,
+                    a.balance - COALESCE(p.balance, a.balance) as change_24h,
+                    a.raw_data
+                FROM accounts a
+                LEFT JOIN previous_balances p ON a.account_index = p.account_index
+                WHERE a.balance > 0
+                ORDER BY a.balance DESC
+            '''
+        else:
+            query = '''
+                SELECT 
+                    a.account_index,
+                    a.address,
+                    a.balance,
+                    a.balance as previous_balance,
+                    0 as change_24h,
+                    a.raw_data
+                FROM accounts a
+                WHERE a.balance > 0
+                ORDER BY a.balance DESC
+            '''
+        
         if limit:
             query += f' LIMIT {limit}'
         
-        cursor.execute(query, (yesterday,))
+        cursor.execute(query)
         rows = cursor.fetchall()
         conn.close()
         
@@ -179,6 +195,23 @@ class Database:
         total = cursor.fetchone()[0] or 0
         conn.close()
         return count, total
+    
+    def store_previous_balances(self, balances: dict):
+        """Store previous balances from GitHub CSV for change calculation"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS previous_balances (
+                account_index INTEGER PRIMARY KEY,
+                balance REAL
+            )
+        ''')
+        for acc_idx, balance in balances.items():
+            cursor.execute('INSERT OR REPLACE INTO previous_balances (account_index, balance) VALUES (?, ?)', 
+                          (acc_idx, balance))
+        conn.commit()
+        conn.close()
+        print(f"📊 Stored {len(balances):,} previous balances for change tracking")
 
 
 class Scraper:
@@ -318,19 +351,32 @@ async def main():
     if len(indexes) < 1000:
         # Database is empty or small - fetch top holders from existing GitHub CSV
         print("⚠️ Database needs initial data. Fetching top holders from GitHub...")
+        previous_balances = {}  # Store previous balances for change tracking
         try:
             import requests
             csv_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/top_holders.csv"
             response = requests.get(csv_url)
             if response.status_code == 200:
                 lines = response.text.strip().split('\n')
-                # Skip header, get account_index from each row
+                # Skip header, get account_index and balance from each row
                 indexes = []
+                header = lines[0].split(',')
+                balance_idx = header.index('balance') if 'balance' in header else 2
+                
                 for line in lines[1:]:
                     parts = line.split(',')
                     if parts[0].isdigit():
-                        indexes.append(int(parts[0]))
+                        acc_idx = int(parts[0])
+                        indexes.append(acc_idx)
+                        try:
+                            previous_balances[acc_idx] = float(parts[balance_idx])
+                        except:
+                            previous_balances[acc_idx] = 0
+                
                 print(f"📥 Loaded {len(indexes):,} account indexes from GitHub")
+                
+                # Store previous balances in database for change calculation
+                db.store_previous_balances(previous_balances)
             else:
                 print("⚠️ Could not fetch CSV from GitHub, using range 0-50000")
                 indexes = list(range(0, 50000))
