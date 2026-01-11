@@ -95,11 +95,29 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Check if previous_balances table exists
+        # Check if daily_baseline table exists (preferred for 24h tracking)
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_baseline'")
+        has_baseline = cursor.fetchone() is not None
+        
+        # Check if previous_balances table exists (fallback)
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='previous_balances'")
         has_previous = cursor.fetchone() is not None
         
-        if has_previous:
+        if has_baseline:
+            query = '''
+                SELECT 
+                    a.account_index,
+                    a.address,
+                    a.balance,
+                    COALESCE(b.balance, a.balance) as baseline_balance,
+                    a.balance - COALESCE(b.balance, a.balance) as change_24h,
+                    a.raw_data
+                FROM accounts a
+                LEFT JOIN daily_baseline b ON a.account_index = b.account_index
+                WHERE a.balance > 0
+                ORDER BY a.balance DESC
+            '''
+        elif has_previous:
             query = '''
                 SELECT 
                     a.account_index,
@@ -212,6 +230,64 @@ class Database:
         conn.commit()
         conn.close()
         print(f"📊 Stored {len(balances):,} previous balances for change tracking")
+    
+    def store_daily_baseline(self, balances: dict, current_time: str):
+        """Store baseline only if existing baseline is older than 24 hours"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Create table if not exists
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS daily_baseline (
+                account_index INTEGER PRIMARY KEY,
+                balance REAL,
+                baseline_time TEXT
+            )
+        ''')
+        
+        # Check when baseline was last set
+        cursor.execute('SELECT baseline_time FROM daily_baseline LIMIT 1')
+        row = cursor.fetchone()
+        
+        if row and row[0]:
+            from datetime import datetime, timedelta
+            try:
+                baseline_time = datetime.fromisoformat(row[0])
+                now = datetime.utcnow()
+                hours_old = (now - baseline_time).total_seconds() / 3600
+                
+                if hours_old < 24:
+                    print(f"📊 Baseline is {hours_old:.1f}h old - keeping for 24h tracking")
+                    conn.close()
+                    return False
+                else:
+                    print(f"📊 Baseline is {hours_old:.1f}h old - updating to new baseline")
+            except:
+                pass
+        
+        # Clear old baseline and set new one
+        cursor.execute('DELETE FROM daily_baseline')
+        for acc_idx, balance in balances.items():
+            cursor.execute('INSERT INTO daily_baseline (account_index, balance, baseline_time) VALUES (?, ?, ?)', 
+                          (acc_idx, balance, current_time))
+        conn.commit()
+        conn.close()
+        print(f"📊 Set new baseline at {current_time} with {len(balances):,} accounts")
+        return True
+    
+    def get_daily_baseline(self):
+        """Get the daily baseline balances"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_baseline'")
+        if not cursor.fetchone():
+            conn.close()
+            return {}
+        
+        cursor.execute('SELECT account_index, balance FROM daily_baseline')
+        baseline = {row[0]: row[1] for row in cursor.fetchall()}
+        conn.close()
+        return baseline
 
 
 class Scraper:
@@ -377,6 +453,10 @@ async def main():
                 
                 # Store previous balances in database for change calculation
                 db.store_previous_balances(previous_balances)
+                
+                # Set daily baseline (only updates if older than 24h)
+                now = datetime.utcnow().isoformat()
+                db.store_daily_baseline(previous_balances, now)
             else:
                 print("⚠️ Could not fetch CSV from GitHub, using range 0-50000")
                 indexes = list(range(0, 50000))
