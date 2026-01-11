@@ -410,6 +410,53 @@ def push_to_github(csv_path: str, github_token: str, repo: str):
         print(f"❌ GitHub error: {response.status_code} - {response.text}")
 
 
+def fetch_change_history(github_token: str, repo: str) -> dict:
+    """Fetch existing change history from GitHub."""
+    import requests
+    
+    url = f"https://raw.githubusercontent.com/{repo}/main/change_history.json"
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    return {"changes": [], "last_updated": None}
+
+
+def push_change_history(history: dict, github_token: str, repo: str):
+    """Push change history JSON to GitHub."""
+    import base64
+    import requests
+    
+    content = json.dumps(history, indent=2)
+    content_b64 = base64.b64encode(content.encode()).decode()
+    
+    url = f"https://api.github.com/repos/{repo}/contents/change_history.json"
+    headers = {
+        'Authorization': f'token {github_token}',
+        'Accept': 'application/vnd.github.v3+json'
+    }
+    
+    # Get current file SHA
+    response = requests.get(url, headers=headers)
+    sha = response.json().get('sha') if response.status_code == 200 else None
+    
+    data = {
+        'message': f'Update change history {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC',
+        'content': content_b64,
+    }
+    if sha:
+        data['sha'] = sha
+    
+    response = requests.put(url, headers=headers, json=data)
+    
+    if response.status_code in [200, 201]:
+        print("✅ Change history saved!")
+    else:
+        print(f"⚠️ Could not save change history: {response.status_code}")
+
+
 async def main():
     print("="*60)
     print(f"🚀 Lighter Auto-Updater - {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
@@ -421,49 +468,49 @@ async def main():
     count, total = db.get_stats()
     print(f"📊 Current DB: {count:,} accounts, {total:,.0f} LIT")
     
-    # Get top account indexes to update
-    indexes = db.get_top_account_indexes(TOP_HOLDERS)
+    # Always fetch top holders from GitHub CSV as source of truth
+    print("📥 Fetching top holders from GitHub...")
+    previous_balances = {}
+    try:
+        import requests
+        csv_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/top_holders.csv"
+        response = requests.get(csv_url)
+        if response.status_code == 200:
+            lines = response.text.strip().split('\n')
+            header = lines[0].split(',')
+            balance_idx = header.index('balance') if 'balance' in header else 2
+            
+            indexes = []
+            for line in lines[1:]:
+                parts = line.split(',')
+                if parts[0].isdigit():
+                    acc_idx = int(parts[0])
+                    indexes.append(acc_idx)
+                    try:
+                        previous_balances[acc_idx] = float(parts[balance_idx])
+                    except:
+                        previous_balances[acc_idx] = 0
+            
+            print(f"📥 Loaded {len(indexes):,} account indexes from GitHub")
+            
+            # Store previous balances for change calculation
+            db.store_previous_balances(previous_balances)
+            
+            # Set daily baseline (only updates if older than 24h)
+            now = datetime.utcnow().isoformat()
+            db.store_daily_baseline(previous_balances, now)
+        else:
+            print(f"⚠️ Could not fetch CSV from GitHub (status {response.status_code})")
+            indexes = db.get_top_account_indexes(TOP_HOLDERS)
+    except Exception as e:
+        print(f"⚠️ Error fetching CSV: {e}")
+        indexes = db.get_top_account_indexes(TOP_HOLDERS)
     
-    if len(indexes) < 1000:
-        # Database is empty or small - fetch top holders from existing GitHub CSV
-        print("⚠️ Database needs initial data. Fetching top holders from GitHub...")
-        previous_balances = {}  # Store previous balances for change tracking
-        try:
-            import requests
-            csv_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/top_holders.csv"
-            response = requests.get(csv_url)
-            if response.status_code == 200:
-                lines = response.text.strip().split('\n')
-                # Skip header, get account_index and balance from each row
-                indexes = []
-                header = lines[0].split(',')
-                balance_idx = header.index('balance') if 'balance' in header else 2
-                
-                for line in lines[1:]:
-                    parts = line.split(',')
-                    if parts[0].isdigit():
-                        acc_idx = int(parts[0])
-                        indexes.append(acc_idx)
-                        try:
-                            previous_balances[acc_idx] = float(parts[balance_idx])
-                        except:
-                            previous_balances[acc_idx] = 0
-                
-                print(f"📥 Loaded {len(indexes):,} account indexes from GitHub")
-                
-                # Store previous balances in database for change calculation
-                db.store_previous_balances(previous_balances)
-                
-                # Set daily baseline (only updates if older than 24h)
-                now = datetime.utcnow().isoformat()
-                db.store_daily_baseline(previous_balances, now)
-            else:
-                print("⚠️ Could not fetch CSV from GitHub, using range 0-50000")
-                indexes = list(range(0, 50000))
-        except Exception as e:
-            print(f"⚠️ Error fetching CSV: {e}, using range 0-50000")
-            indexes = list(range(0, 50000))
-        random.shuffle(indexes)
+    if not indexes:
+        print("❌ No accounts to scrape!")
+        return
+    
+    random.shuffle(indexes)
     
     target_count = len(indexes)
     max_retries = 3
@@ -525,6 +572,44 @@ async def main():
     
     if GITHUB_TOKEN and GITHUB_REPO:
         push_to_github(CSV_PATH, GITHUB_TOKEN, GITHUB_REPO)
+        
+        # Track significant changes in history
+        print("\n📜 Updating change history...")
+        history = fetch_change_history(GITHUB_TOKEN, GITHUB_REPO)
+        
+        # Read the exported CSV to find significant changes
+        significant_changes = []
+        try:
+            with open(CSV_PATH, 'r') as f:
+                lines = f.read().strip().split('\n')
+                header = lines[0].split(',')
+                change_idx = header.index('change_24h') if 'change_24h' in header else -1
+                
+                if change_idx >= 0:
+                    for line in lines[1:]:
+                        parts = line.split(',')
+                        try:
+                            change = float(parts[change_idx])
+                            if abs(change) >= 10000:  # Track changes >= 10K LIT
+                                significant_changes.append({
+                                    'account_index': parts[0],
+                                    'address': parts[1],
+                                    'balance': float(parts[2]),
+                                    'change': change,
+                                    'timestamp': datetime.utcnow().isoformat()
+                                })
+                        except:
+                            pass
+        except Exception as e:
+            print(f"⚠️ Error reading changes: {e}")
+        
+        if significant_changes:
+            # Add to history (keep last 1000 changes)
+            history['changes'] = (significant_changes + history.get('changes', []))[:1000]
+            history['last_updated'] = datetime.utcnow().isoformat()
+            push_change_history(history, GITHUB_TOKEN, GITHUB_REPO)
+            print(f"   Added {len(significant_changes)} significant changes to history")
+        
         print("\n✅ Deployed successfully!")
     else:
         print("⚠️ GitHub credentials not set. Skipping push.")
