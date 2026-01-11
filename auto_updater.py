@@ -103,7 +103,27 @@ class Database:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='previous_balances'")
         has_previous = cursor.fetchone() is not None
         
-        if has_baseline:
+        # Check if original_indexes table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='original_indexes'")
+        has_original = cursor.fetchone() is not None
+        
+        # Use original_indexes to ensure we always export all accounts
+        if has_original and has_baseline:
+            query = '''
+                SELECT 
+                    o.account_index,
+                    COALESCE(a.address, p.address, '') as address,
+                    COALESCE(a.balance, 0) as balance,
+                    COALESCE(b.balance, p.balance, 0) as baseline_balance,
+                    COALESCE(a.balance, 0) - COALESCE(b.balance, p.balance, 0) as change_24h,
+                    a.raw_data
+                FROM original_indexes o
+                LEFT JOIN accounts a ON o.account_index = a.account_index
+                LEFT JOIN daily_baseline b ON o.account_index = b.account_index
+                LEFT JOIN previous_balances p ON o.account_index = p.account_index
+                ORDER BY COALESCE(a.balance, 0) DESC
+            '''
+        elif has_baseline:
             query = '''
                 SELECT 
                     a.account_index,
@@ -145,7 +165,7 @@ class Database:
                 ORDER BY a.balance DESC
             '''
         
-        if limit:
+        if limit and not has_original:
             query += f' LIMIT {limit}'
         
         cursor.execute(query)
@@ -214,19 +234,21 @@ class Database:
         conn.close()
         return count, total
     
-    def store_previous_balances(self, balances: dict):
+    def store_previous_balances(self, balances: dict, addresses: dict = None):
         """Store previous balances from GitHub CSV for change calculation"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS previous_balances (
                 account_index INTEGER PRIMARY KEY,
-                balance REAL
+                balance REAL,
+                address TEXT
             )
         ''')
         for acc_idx, balance in balances.items():
-            cursor.execute('INSERT OR REPLACE INTO previous_balances (account_index, balance) VALUES (?, ?)', 
-                          (acc_idx, balance))
+            addr = addresses.get(acc_idx, '') if addresses else ''
+            cursor.execute('INSERT OR REPLACE INTO previous_balances (account_index, balance, address) VALUES (?, ?, ?)', 
+                          (acc_idx, balance, addr))
         conn.commit()
         conn.close()
         print(f"📊 Stored {len(balances):,} previous balances for change tracking")
@@ -288,6 +310,34 @@ class Database:
         baseline = {row[0]: row[1] for row in cursor.fetchall()}
         conn.close()
         return baseline
+    
+    def store_original_indexes(self, indexes: List[int]):
+        """Store original 15k indexes to always export all of them"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS original_indexes (
+                account_index INTEGER PRIMARY KEY
+            )
+        ''')
+        cursor.execute('DELETE FROM original_indexes')
+        for idx in indexes:
+            cursor.execute('INSERT OR IGNORE INTO original_indexes (account_index) VALUES (?)', (idx,))
+        conn.commit()
+        conn.close()
+    
+    def get_original_indexes(self):
+        """Get original indexes list"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='original_indexes'")
+        if not cursor.fetchone():
+            conn.close()
+            return []
+        cursor.execute('SELECT account_index FROM original_indexes')
+        indexes = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return indexes
 
 
 class Scraper:
@@ -471,6 +521,8 @@ async def main():
     # Always fetch top holders from GitHub CSV as source of truth
     print("📥 Fetching top holders from GitHub...")
     previous_balances = {}
+    previous_addresses = {}
+    original_indexes = []  # Keep original list
     try:
         import requests
         csv_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/top_holders.csv"
@@ -479,26 +531,35 @@ async def main():
             lines = response.text.strip().split('\n')
             header = lines[0].split(',')
             balance_idx = header.index('balance') if 'balance' in header else 2
+            address_idx = header.index('address') if 'address' in header else 1
             
-            indexes = []
             for line in lines[1:]:
                 parts = line.split(',')
                 if parts[0].isdigit():
                     acc_idx = int(parts[0])
-                    indexes.append(acc_idx)
+                    original_indexes.append(acc_idx)
                     try:
                         previous_balances[acc_idx] = float(parts[balance_idx])
                     except:
                         previous_balances[acc_idx] = 0
+                    try:
+                        previous_addresses[acc_idx] = parts[address_idx]
+                    except:
+                        previous_addresses[acc_idx] = ''
             
-            print(f"📥 Loaded {len(indexes):,} account indexes from GitHub")
+            print(f"📥 Loaded {len(original_indexes):,} account indexes from GitHub")
             
             # Store previous balances for change calculation
-            db.store_previous_balances(previous_balances)
+            db.store_previous_balances(previous_balances, previous_addresses)
+            
+            # Store original indexes so we always export all of them
+            db.store_original_indexes(original_indexes)
             
             # Set daily baseline (only updates if older than 24h)
             now = datetime.utcnow().isoformat()
             db.store_daily_baseline(previous_balances, now)
+            
+            indexes = original_indexes.copy()
         else:
             print(f"⚠️ Could not fetch CSV from GitHub (status {response.status_code})")
             indexes = db.get_top_account_indexes(TOP_HOLDERS)
